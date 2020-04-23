@@ -1,2 +1,7 @@
-/gowechat:
-        repo: https://github.com/bigwhite/gowechat
+/devops/jenkinsfilext/:
+  repo: https://gitlab-ce.alauda.cn/devops/jenkinsfilext
+/devops/devops-apiserver/:
+  repo: https://gitlab-ce.alauda.cn/devops/devops-apiserver
+/devops-apiserver2:
+  repo: https://gitlab-ce.alauda.cn/devops/devops-apiserver
+

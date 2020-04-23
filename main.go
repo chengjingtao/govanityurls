@@ -8,11 +8,24 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"time"
+
+	"os"
+	"os/signal"
+	"syscall"
+
+	"context"
+
+	"sync"
 
 	"gopkg.in/yaml.v2"
 )
 
 var host string
+var path string
+var interval time.Duration
+
+var mutex sync.RWMutex = sync.RWMutex{}
 
 var m map[string]struct {
 	Repo    string `yaml:"repo,omitempty"`
@@ -20,14 +33,37 @@ var m map[string]struct {
 }
 
 func init() {
-	flag.StringVar(&host, "host", "", "custom domain name, e.g. tonybai.com")
+	flag.StringVar(&host, "host", "", "custom domain name, e.g. alauda.cn")
+	flag.StringVar(&path, "config", "/app/config/vanity.yaml", "config path, e.g. /app/config/vanity.yaml or https://example.com/vanity.yaml")
+	flag.DurationVar(&interval, "interval", 2*time.Minute, "interval to refresh yaml")
+}
 
-	vanity, err := ioutil.ReadFile("./vanity.yaml")
-	if err != nil {
-		log.Fatal(err)
+func main() {
+	flag.Parse()
+
+	refreshWhenSig()
+	refreshYaml()
+
+	if host == "" {
+		usage()
+		return
 	}
+
+	http.Handle("/", http.HandlerFunc(handle))
+	log.Fatalln(http.ListenAndServe("0.0.0.0:80", nil))
+}
+
+func loadYaml() error {
+	log.Println("refresh yaml...")
+	vanity, err := readFile()
+	if err != nil {
+		return err
+	}
+
+	mutex.Lock()
+	defer mutex.Unlock()
 	if err := yaml.Unmarshal(vanity, &m); err != nil {
-		log.Fatal(err)
+		return err
 	}
 	for _, e := range m {
 		if e.Display != "" {
@@ -37,17 +73,24 @@ func init() {
 			e.Display = fmt.Sprintf("%v %v/tree/master{/dir} %v/blob/master{/dir}/{file}#L{line}", e.Repo, e.Repo, e.Repo)
 		}
 	}
+	return nil
 }
 
 func handle(w http.ResponseWriter, r *http.Request) {
 	current := r.URL.Path
+	log.Printf("GET %s", current)
+
+	mutex.RLock()
 	p, ok := m[current]
+	mutex.RUnlock()
+
 	if !ok {
+		log.Printf("GET 404 %s", current)
 		http.NotFound(w, r)
 		return
 	}
 
-	if err := vanityTmpl.Execute(w, struct {
+	err := vanityTmpl.Execute(w, struct {
 		Import  string
 		Repo    string
 		Display string
@@ -55,9 +98,14 @@ func handle(w http.ResponseWriter, r *http.Request) {
 		Import:  host + current,
 		Repo:    p.Repo,
 		Display: p.Display,
-	}); err != nil {
+	})
+
+	if err != nil {
 		http.Error(w, "cannot render the page", http.StatusInternalServerError)
+		return
 	}
+
+	log.Printf("GET 200 %s", current)
 }
 
 var vanityTmpl, _ = template.New("vanity").Parse(`<!DOCTYPE html>
@@ -80,14 +128,57 @@ func usage() {
 	flag.PrintDefaults()
 }
 
-func main() {
-	flag.Parse()
+func refreshWhenSig() {
 
-	if host == "" {
-		usage()
-		return
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, syscall.SIGHUP)
+
+	go func() {
+		for {
+			s := <-sigs
+			log.Println("get signal:", s)
+			loadYaml()
+		}
+	}()
+}
+
+func readFile() ([]byte, error) {
+	if strings.HasPrefix(path, "http") || strings.HasPrefix(path, "https") {
+		return loadHTTPFile()
+	}
+	return loadDiskFile()
+}
+
+func refreshYaml() {
+	go func() {
+		for {
+			loadYaml()
+			time.Sleep(interval)
+		}
+	}()
+}
+
+func loadHTTPFile() ([]byte, error) {
+	http.DefaultClient.Timeout = 30
+	request, err := http.NewRequestWithContext(context.Background(), "GET", path, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := http.DefaultClient.Do(request)
+	if err != nil {
+		log.Printf("error to request %s: %s", path, err.Error())
+		return nil, err
+	}
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("response status code %d", resp.StatusCode)
 	}
 
-	http.Handle("/", http.HandlerFunc(handle))
-	log.Fatalln(http.ListenAndServe("0.0.0.0:8080", nil))
+	vanity, err := ioutil.ReadAll(resp.Body)
+	log.Printf("error read response: %s", err.Error())
+	return vanity, err
+}
+
+func loadDiskFile() ([]byte, error) {
+	vanity, err := ioutil.ReadFile(path)
+	return vanity, err
 }
